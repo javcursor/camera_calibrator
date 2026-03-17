@@ -1,12 +1,30 @@
 #include "camera/GenTLBackend.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <dlfcn.h>
+#include <fstream>
 #include <limits>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
+
+#ifdef HAVE_GENTL_GENAPI
+#include <Base/GCException.h>
+#include <GenApi/IBoolean.h>
+#include <GenApi/ICommand.h>
+#include <GenApi/IFloat.h>
+#include <GenApi/IInteger.h>
+#include <GenApi/INodeMap.h>
+#include <GenApi/IPort.h>
+#include <GenApi/IString.h>
+#include <GenApi/NodeMapFactory.h>
+#include <GenApi/NodeMapRef.h>
+#include <GenApi/Pointer.h>
+#endif
 
 namespace {
 using bool8_t = uint8_t;
@@ -15,6 +33,7 @@ using INFO_DATATYPE = int32_t;
 using TL_HANDLE = void*;
 using IF_HANDLE = void*;
 using DEV_HANDLE = void*;
+using PORT_HANDLE = void*;
 using DS_HANDLE = void*;
 using EVENT_HANDLE = void*;
 using BUFFER_HANDLE = void*;
@@ -25,6 +44,7 @@ using ACQ_START_FLAGS = int32_t;
 using ACQ_STOP_FLAGS = int32_t;
 using ACQ_QUEUE_TYPE = int32_t;
 using DEVICE_ACCESS_FLAGS = int32_t;
+using URL_INFO_CMD = int32_t;
 
 constexpr GC_ERROR GC_SUCCESS = 0;
 constexpr GC_ERROR GC_ERR_TIMEOUT = -1011;
@@ -57,6 +77,15 @@ constexpr BUFFER_INFO_CMD BUFFER_INFO_DATA_SIZE = 27;
 constexpr BUFFER_INFO_CMD BUFFER_INFO_TIMESTAMP_NS = 28;
 constexpr BUFFER_INFO_CMD BUFFER_INFO_IS_INCOMPLETE = 7;
 constexpr BUFFER_INFO_CMD BUFFER_INFO_TIMESTAMP = 3;
+
+constexpr URL_INFO_CMD URL_INFO_URL = 0;
+constexpr URL_INFO_CMD URL_INFO_FILE_REGISTER_ADDRESS = 7;
+constexpr URL_INFO_CMD URL_INFO_FILE_SIZE = 8;
+constexpr URL_INFO_CMD URL_INFO_SCHEME = 9;
+constexpr URL_INFO_CMD URL_INFO_FILENAME = 10;
+
+constexpr int32_t URL_SCHEME_LOCAL = 0;
+constexpr int32_t URL_SCHEME_FILE = 2;
 
 constexpr uint64_t PAYLOAD_TYPE_IMAGE = 1;
 
@@ -93,6 +122,7 @@ struct GenTLFns {
   GC_ERROR (*IFClose)(IF_HANDLE hIF) = nullptr;
 
   GC_ERROR (*DevClose)(DEV_HANDLE hDevice) = nullptr;
+  GC_ERROR (*DevGetPort)(DEV_HANDLE hDevice, PORT_HANDLE* phRemoteDevice) = nullptr;
   GC_ERROR (*DevGetNumDataStreams)(DEV_HANDLE hDevice, uint32_t* piNumDataStreams) = nullptr;
   GC_ERROR (*DevGetDataStreamID)(DEV_HANDLE hDevice, uint32_t iIndex, char* sDataStreamID,
                                  size_t* piSize) = nullptr;
@@ -120,6 +150,14 @@ struct GenTLFns {
   GC_ERROR (*EventGetData)(EVENT_HANDLE hEvent, void* pBuffer, size_t* piSize,
                            uint64_t iTimeout) = nullptr;
   GC_ERROR (*EventKill)(EVENT_HANDLE hEvent) = nullptr;
+  GC_ERROR (*GCGetNumPortURLs)(PORT_HANDLE hPort, uint32_t* piNumURLs) = nullptr;
+  GC_ERROR (*GCGetPortURL)(PORT_HANDLE hPort, char* sURL, size_t* piSize) = nullptr;
+  GC_ERROR (*GCGetPortURLInfo)(PORT_HANDLE hPort, uint32_t iURLIndex, URL_INFO_CMD iInfoCmd,
+                               INFO_DATATYPE* piType, void* pBuffer, size_t* piSize) = nullptr;
+  GC_ERROR (*GCReadPort)(PORT_HANDLE hPort, uint64_t iAddress, void* pBuffer, size_t* piSize) =
+      nullptr;
+  GC_ERROR (*GCWritePort)(PORT_HANDLE hPort, uint64_t iAddress, const void* pBuffer,
+                          size_t* piSize) = nullptr;
 };
 
 GenTLFns g_fns;
@@ -133,6 +171,10 @@ bool loadSymbol(void* lib, void** fn, const char* name, std::string& status) {
   return true;
 }
 
+void loadOptionalSymbol(void* lib, void** fn, const char* name) {
+  *fn = dlsym(lib, name);
+}
+
 std::string trimTrailingNulls(std::string value) {
   while (!value.empty() && value.back() == '\0') {
     value.pop_back();
@@ -140,19 +182,442 @@ std::string trimTrailingNulls(std::string value) {
   return value;
 }
 
+char toLowerAscii(char c) {
+  if (c >= 'A' && c <= 'Z') return static_cast<char>(c - 'A' + 'a');
+  return c;
+}
+
+bool startsWithIgnoreCase(const std::string& value, const std::string& prefix) {
+  if (value.size() < prefix.size()) return false;
+  for (size_t i = 0; i < prefix.size(); ++i) {
+    if (toLowerAscii(value[i]) != toLowerAscii(prefix[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::string stripUrlQuery(const std::string& value) {
+  const size_t query = value.find('?');
+  return query == std::string::npos ? value : value.substr(0, query);
+}
+
+#ifdef HAVE_GENTL_GENAPI
+constexpr size_t kPortIoChunkSize = 4096;
+
+std::string toStdString(const GENICAM_NAMESPACE::gcstring& value) {
+  return value.c_str() ? std::string(value.c_str()) : std::string();
+}
+
+struct PortUrl {
+  enum class Kind { Local, File };
+
+  Kind kind = Kind::Local;
+  std::string path;
+  uint64_t address = 0;
+  size_t length = 0;
+  bool zipped = false;
+};
+
+bool parseHexUint64(const std::string& text, uint64_t& out) {
+  if (text.empty()) return false;
+  try {
+    size_t used = 0;
+    out = std::stoull(text, &used, 16);
+    return used == text.size();
+  } catch (...) {
+    return false;
+  }
+}
+
+bool parsePortUrl(const std::string& url, PortUrl& out) {
+  const std::string without_query = stripUrlQuery(url);
+
+  if (startsWithIgnoreCase(without_query, "local:")) {
+    size_t path_start = std::strlen("local:");
+    while (path_start < without_query.size() && without_query[path_start] == '/') {
+      ++path_start;
+    }
+    const std::string rest = without_query.substr(path_start);
+    const size_t first_sep = rest.find(';');
+    const size_t second_sep = first_sep == std::string::npos ? std::string::npos : rest.find(';', first_sep + 1);
+    if (first_sep == std::string::npos || second_sep == std::string::npos) return false;
+
+    out.kind = PortUrl::Kind::Local;
+    out.path = rest.substr(0, first_sep);
+    uint64_t length = 0;
+    if (!parseHexUint64(rest.substr(first_sep + 1, second_sep - first_sep - 1), out.address) ||
+        !parseHexUint64(rest.substr(second_sep + 1), length)) {
+      return false;
+    }
+    out.length = static_cast<size_t>(length);
+    out.zipped = out.path.size() >= 4 &&
+                 out.path.compare(out.path.size() - 4, 4, ".zip") == 0;
+    return out.length > 0;
+  }
+
+  if (startsWithIgnoreCase(without_query, "file:")) {
+    out.kind = PortUrl::Kind::File;
+    out.path = without_query.substr(std::strlen("file:"));
+    while (out.path.size() >= 2 && out.path[0] == '/' && out.path[1] == '/') {
+      out.path.erase(0, 1);
+    }
+    out.zipped = out.path.size() >= 4 &&
+                 out.path.compare(out.path.size() - 4, 4, ".zip") == 0;
+    return !out.path.empty();
+  }
+
+  return false;
+}
+
+bool readFileBytes(const std::string& path, std::vector<uint8_t>& out) {
+  std::ifstream input(path, std::ios::binary);
+  if (!input) return false;
+  input.seekg(0, std::ios::end);
+  const std::streamoff length = input.tellg();
+  if (length <= 0) return false;
+  input.seekg(0, std::ios::beg);
+  out.resize(static_cast<size_t>(length));
+  input.read(reinterpret_cast<char*>(out.data()), length);
+  return input.good() || input.eof();
+}
+
+bool readPortRange(PORT_HANDLE port, uint64_t address, void* buffer, size_t length) {
+  if (!g_fns.GCReadPort || !port) return false;
+  auto* out = static_cast<uint8_t*>(buffer);
+  size_t remaining = length;
+  while (remaining > 0) {
+    const size_t chunk = std::min(remaining, kPortIoChunkSize);
+    size_t transferred = chunk;
+    if (g_fns.GCReadPort(port, address, out, &transferred) != GC_SUCCESS || transferred != chunk) {
+      return false;
+    }
+    out += chunk;
+    address += chunk;
+    remaining -= chunk;
+  }
+  return true;
+}
+
+bool writePortRange(PORT_HANDLE port, uint64_t address, const void* buffer, size_t length) {
+  if (!g_fns.GCWritePort || !port) return false;
+  const auto* in = static_cast<const uint8_t*>(buffer);
+  size_t remaining = length;
+  while (remaining > 0) {
+    const size_t chunk = std::min(remaining, kPortIoChunkSize);
+    size_t transferred = chunk;
+    if (g_fns.GCWritePort(port, address, in, &transferred) != GC_SUCCESS || transferred != chunk) {
+      return false;
+    }
+    in += chunk;
+    address += chunk;
+    remaining -= chunk;
+  }
+  return true;
+}
+
+bool getPortUrlInfoString(PORT_HANDLE port, uint32_t index, URL_INFO_CMD cmd, std::string& out) {
+  if (!g_fns.GCGetPortURLInfo) return false;
+  INFO_DATATYPE type = 0;
+  size_t size = 0;
+  if (g_fns.GCGetPortURLInfo(port, index, cmd, &type, nullptr, &size) != GC_SUCCESS || size == 0) {
+    return false;
+  }
+  std::string value(size, '\0');
+  if (g_fns.GCGetPortURLInfo(port, index, cmd, &type, value.data(), &size) != GC_SUCCESS) {
+    return false;
+  }
+  out = trimTrailingNulls(value);
+  return !out.empty();
+}
+
+template <typename T>
+bool getPortUrlInfoNumeric(PORT_HANDLE port, uint32_t index, URL_INFO_CMD cmd, T& out) {
+  if (!g_fns.GCGetPortURLInfo) return false;
+  std::array<uint8_t, sizeof(uint64_t)> raw{};
+  INFO_DATATYPE type = 0;
+  size_t size = raw.size();
+  if (g_fns.GCGetPortURLInfo(port, index, cmd, &type, raw.data(), &size) != GC_SUCCESS ||
+      size == 0 || size > raw.size()) {
+    return false;
+  }
+  uint64_t value = 0;
+  std::memcpy(&value, raw.data(), size);
+  if constexpr (std::is_integral_v<T>) {
+    if (value > static_cast<uint64_t>(std::numeric_limits<T>::max())) {
+      return false;
+    }
+  }
+  out = static_cast<T>(value);
+  return true;
+}
+
+bool readPortBytes(PORT_HANDLE port, uint64_t address, size_t length, std::vector<uint8_t>& out) {
+  if (!port || length == 0) return false;
+  out.resize(length);
+  return readPortRange(port, address, out.data(), length);
+}
+
+bool fetchPortXml(PORT_HANDLE port, const std::vector<std::string>& urls, std::vector<uint8_t>& data,
+                  bool& zipped) {
+  for (const std::string& url_text : urls) {
+    PortUrl url;
+    if (!parsePortUrl(url_text, url)) continue;
+
+    std::vector<uint8_t> candidate;
+    const bool ok = url.kind == PortUrl::Kind::Local ? readPortBytes(port, url.address, url.length, candidate)
+                                                     : readFileBytes(url.path, candidate);
+    if (!ok || candidate.empty()) continue;
+
+    data = std::move(candidate);
+    zipped = url.zipped;
+    return true;
+  }
+
+  return false;
+}
+
+bool trySetEnumValue(GenApi::INodeMap& node_map, const char* name, const char* value) {
+  GenApi::CEnumerationPtr param(node_map.GetNode(name));
+  if (!GenApi::IsWritable(param)) {
+    return false;
+  }
+  GenApi::CEnumEntryPtr entry(param->GetEntryByName(value));
+  if (!GenApi::IsReadable(entry)) {
+    return false;
+  }
+  param->FromString(value, true);
+  return true;
+}
+
+bool tryExecuteCommand(GenApi::INodeMap& node_map, const char* name) {
+  GenApi::CCommandPtr command(node_map.GetNode(name));
+  if (!GenApi::IsWritable(command)) {
+    return false;
+  }
+  command->Execute(true);
+  return true;
+}
+
+bool trySetIntegerValue(GenApi::INodeMap& node_map, const char* name, int64_t value) {
+  GenApi::CIntegerPtr param(node_map.GetNode(name));
+  if (!GenApi::IsWritable(param)) {
+    return false;
+  }
+  param->SetValue(value, true);
+  return true;
+}
+
+void tryDisableTrigger(GenApi::INodeMap& node_map, const char* selector) {
+  if (!trySetEnumValue(node_map, "TriggerSelector", selector)) {
+    return;
+  }
+  (void)trySetEnumValue(node_map, "TriggerMode", "Off");
+}
+
+FeatureType featureTypeFromNode(const GenApi::INode& node) {
+  switch (node.GetPrincipalInterfaceType()) {
+    case GenApi::intfIInteger:
+      return FeatureType::Integer;
+    case GenApi::intfIFloat:
+      return FeatureType::Float;
+    case GenApi::intfIBoolean:
+      return FeatureType::Boolean;
+    case GenApi::intfIEnumeration:
+      return FeatureType::Enumeration;
+    case GenApi::intfIString:
+      return FeatureType::String;
+    case GenApi::intfICommand:
+      return FeatureType::Command;
+    case GenApi::intfICategory:
+      return FeatureType::Category;
+    default:
+      return FeatureType::Unknown;
+  }
+}
+
+bool isUserFeatureNode(GenApi::INode* node) {
+  if (!node || !node->IsFeature() || !GenApi::IsImplemented(node) || !GenApi::IsAvailable(node)) {
+    return false;
+  }
+  const std::string name = toStdString(node->GetName());
+  return !name.empty() && name.rfind("d_", 0) != 0;
+}
+
+void fillEnumEntries(GenApi::INode& node, FeatureInfo& info) {
+  GenApi::CEnumerationPtr enumeration(&node);
+  if (!GenApi::IsAvailable(enumeration)) {
+    return;
+  }
+  GenApi::NodeList_t entries;
+  enumeration->GetEntries(entries);
+  info.enum_entries.reserve(entries.size());
+  for (GenApi::INode* entry_node : entries) {
+    GenApi::CEnumEntryPtr entry(entry_node);
+    if (!GenApi::IsAvailable(entry)) {
+      continue;
+    }
+    const std::string symbolic = toStdString(entry->GetSymbolic());
+    if (!symbolic.empty()) {
+      info.enum_entries.push_back(symbolic);
+    }
+  }
+}
+
+void fillFeatureInfo(GenApi::INode& node, FeatureInfo& info) {
+  info.id = toStdString(node.GetName());
+  info.display_name = toStdString(node.GetDisplayName());
+  if (info.display_name.empty()) {
+    info.display_name = info.id;
+  }
+  info.type = featureTypeFromNode(node);
+  info.readable = GenApi::IsReadable(&node);
+  info.writable = GenApi::IsWritable(&node);
+  info.backend_handle = &node;
+
+  if (info.type == FeatureType::Integer) {
+    GenApi::CIntegerPtr integer(&node);
+    if (GenApi::IsAvailable(integer)) {
+      info.min = static_cast<double>(integer->GetMin());
+      info.max = static_cast<double>(integer->GetMax());
+    }
+  } else if (info.type == FeatureType::Float) {
+    GenApi::CFloatPtr floating(&node);
+    if (GenApi::IsAvailable(floating)) {
+      info.min = floating->GetMin();
+      info.max = floating->GetMax();
+    }
+  } else if (info.type == FeatureType::Enumeration) {
+    fillEnumEntries(node, info);
+  }
+}
+
+bool readFeatureValueFromNode(GenApi::INode& node, FeatureType type, FeatureValue& out) {
+  switch (type) {
+    case FeatureType::Integer: {
+      GenApi::CIntegerPtr integer(&node);
+      if (!GenApi::IsReadable(integer)) return false;
+      out.value = integer->GetValue(false, false);
+      return true;
+    }
+    case FeatureType::Float: {
+      GenApi::CFloatPtr floating(&node);
+      if (!GenApi::IsReadable(floating)) return false;
+      out.value = floating->GetValue(false, false);
+      return true;
+    }
+    case FeatureType::Boolean: {
+      GenApi::CBooleanPtr boolean(&node);
+      if (!GenApi::IsReadable(boolean)) return false;
+      out.value = boolean->GetValue(false, false);
+      return true;
+    }
+    case FeatureType::Enumeration:
+    case FeatureType::String: {
+      GenApi::CValuePtr value(&node);
+      if (!GenApi::IsReadable(value)) return false;
+      out.value = toStdString(value->ToString(false, false));
+      return true;
+    }
+    default:
+      return false;
+  }
+}
+
+bool writeFeatureValueToNode(GenApi::INode& node, FeatureType type, const FeatureValue& value) {
+  switch (type) {
+    case FeatureType::Integer: {
+      GenApi::CIntegerPtr integer(&node);
+      const auto* v = std::get_if<int64_t>(&value.value);
+      if (!GenApi::IsWritable(integer) || !v) return false;
+      integer->SetValue(*v, true);
+      return true;
+    }
+    case FeatureType::Float: {
+      GenApi::CFloatPtr floating(&node);
+      const auto* v = std::get_if<double>(&value.value);
+      if (!GenApi::IsWritable(floating) || !v) return false;
+      floating->SetValue(*v, true);
+      return true;
+    }
+    case FeatureType::Boolean: {
+      GenApi::CBooleanPtr boolean(&node);
+      const auto* v = std::get_if<bool>(&value.value);
+      if (!GenApi::IsWritable(boolean) || !v) return false;
+      boolean->SetValue(*v, true);
+      return true;
+    }
+    case FeatureType::Enumeration:
+    case FeatureType::String: {
+      GenApi::CValuePtr string_value(&node);
+      const auto* v = std::get_if<std::string>(&value.value);
+      if (!GenApi::IsWritable(string_value) || !v) return false;
+      string_value->FromString(v->c_str(), true);
+      return true;
+    }
+    default:
+      return false;
+  }
+}
+#endif
+
+template <typename T, typename QueryFn>
+bool readInfoValue(QueryFn&& query, T& out) {
+  INFO_DATATYPE type = 0;
+
+  if constexpr (std::is_pointer_v<T>) {
+    size_t size = sizeof(T);
+    T value = nullptr;
+    if (query(&type, &value, &size) != GC_SUCCESS || size != sizeof(T)) {
+      return false;
+    }
+    out = value;
+    return true;
+  } else if constexpr (std::is_same_v<T, bool8_t>) {
+    std::array<uint8_t, sizeof(uint64_t)> raw{};
+    size_t size = raw.size();
+    if (query(&type, raw.data(), &size) != GC_SUCCESS || size == 0 || size > raw.size()) {
+      return false;
+    }
+
+    uint64_t value = 0;
+    std::memcpy(&value, raw.data(), size);
+    out = value != 0 ? 1 : 0;
+    return true;
+  } else if constexpr (std::is_integral_v<T>) {
+    std::array<uint8_t, sizeof(uint64_t)> raw{};
+    size_t size = raw.size();
+    if (query(&type, raw.data(), &size) != GC_SUCCESS || size == 0 || size > raw.size()) {
+      return false;
+    }
+
+    uint64_t value = 0;
+    std::memcpy(&value, raw.data(), size);
+    if (value > static_cast<uint64_t>(std::numeric_limits<T>::max())) {
+      return false;
+    }
+    out = static_cast<T>(value);
+    return true;
+  } else {
+    size_t size = sizeof(T);
+    return query(&type, &out, &size) == GC_SUCCESS && size == sizeof(T);
+  }
+}
+
 template <typename T>
 bool getStreamInfo(DS_HANDLE stream, STREAM_INFO_CMD cmd, T& out) {
   if (!g_fns.DSGetInfo) return false;
-  size_t size = sizeof(T);
-  return g_fns.DSGetInfo(stream, cmd, nullptr, &out, &size) == GC_SUCCESS && size == sizeof(T);
+  return readInfoValue([&](INFO_DATATYPE* type, void* buffer, size_t* size) {
+    return g_fns.DSGetInfo(stream, cmd, type, buffer, size);
+  }, out);
 }
 
 template <typename T>
 bool getBufferInfo(DS_HANDLE stream, BUFFER_HANDLE buffer, BUFFER_INFO_CMD cmd, T& out) {
   if (!g_fns.DSGetBufferInfo) return false;
-  size_t size = sizeof(T);
-  return g_fns.DSGetBufferInfo(stream, buffer, cmd, nullptr, &out, &size) == GC_SUCCESS &&
-         size == sizeof(T);
+  return readInfoValue([&](INFO_DATATYPE* type, void* data, size_t* size) {
+    return g_fns.DSGetBufferInfo(stream, buffer, cmd, type, data, size);
+  }, out);
 }
 
 bool mapPixelFormat(uint64_t pixel_format, PixelFormat& format, int& channels) {
@@ -192,6 +657,43 @@ bool mapPixelFormat(uint64_t pixel_format, PixelFormat& format, int& channels) {
   }
 }
 }  // namespace
+
+struct GenTLBackend::RemoteControlState {
+#ifdef HAVE_GENTL_GENAPI
+  class PortProxy : public GenApi::IPort {
+   public:
+    explicit PortProxy(PORT_HANDLE port) : port_(port) {}
+
+    GenApi::EAccessMode GetAccessMode() const override { return GenApi::RW; }
+
+    void Read(void* buffer, int64_t address, int64_t length) override {
+      const size_t size = length > 0 ? static_cast<size_t>(length) : 0;
+      if (size == 0) return;
+      if (!readPortRange(port_, static_cast<uint64_t>(address), buffer, size)) {
+        throw RUNTIME_EXCEPTION("GCReadPort failed");
+      }
+    }
+
+    void Write(const void* buffer, int64_t address, int64_t length) override {
+      const size_t size = length > 0 ? static_cast<size_t>(length) : 0;
+      if (size == 0) return;
+      if (!writePortRange(port_, static_cast<uint64_t>(address), buffer, size)) {
+        throw RUNTIME_EXCEPTION("GCWritePort failed");
+      }
+    }
+
+   private:
+    PORT_HANDLE port_ = nullptr;
+  };
+
+  PORT_HANDLE port = nullptr;
+  std::vector<uint8_t> xml_data;
+  std::unique_ptr<PortProxy> port_proxy;
+  GenApi::INodeMap* node_map_ptr = nullptr;
+  GenApi::CNodeMapRef node_map;
+  bool loaded = false;
+#endif
+};
 
 GenTLBackend::~GenTLBackend() {
   unload();
@@ -269,6 +771,13 @@ bool GenTLBackend::load() {
                    status_);
   ok &= loadSymbol(lib_, reinterpret_cast<void**>(&g_fns.EventGetData), "EventGetData", status_);
   ok &= loadSymbol(lib_, reinterpret_cast<void**>(&g_fns.EventKill), "EventKill", status_);
+
+  loadOptionalSymbol(lib_, reinterpret_cast<void**>(&g_fns.DevGetPort), "DevGetPort");
+  loadOptionalSymbol(lib_, reinterpret_cast<void**>(&g_fns.GCGetNumPortURLs), "GCGetNumPortURLs");
+  loadOptionalSymbol(lib_, reinterpret_cast<void**>(&g_fns.GCGetPortURL), "GCGetPortURL");
+  loadOptionalSymbol(lib_, reinterpret_cast<void**>(&g_fns.GCGetPortURLInfo), "GCGetPortURLInfo");
+  loadOptionalSymbol(lib_, reinterpret_cast<void**>(&g_fns.GCReadPort), "GCReadPort");
+  loadOptionalSymbol(lib_, reinterpret_cast<void**>(&g_fns.GCWritePort), "GCWritePort");
 
   if (!ok) {
     unload();
@@ -387,6 +896,7 @@ bool GenTLBackend::open(const CameraInfo& info) {
   if (!lib_ || !tl_) {
     if (!load()) return false;
   }
+  remote_status_.clear();
 
   auto sep = info.id.find('|');
   if (sep == std::string::npos) {
@@ -421,6 +931,206 @@ bool GenTLBackend::open(const CameraInfo& info) {
 
   status_ = "GenTL device abierto";
   return true;
+}
+
+bool GenTLBackend::ensureRemoteControl() {
+  if (remote_control_ && remote_control_->loaded) {
+    return true;
+  }
+  return initializeRemoteControl();
+}
+
+bool GenTLBackend::initializeRemoteControl() {
+  releaseRemoteControl();
+#ifndef HAVE_GENTL_GENAPI
+  status_ = "GenApi remoto no compilado";
+  remote_status_ = status_;
+  return false;
+#else
+  if (!dev_ || !g_fns.DevGetPort || !g_fns.GCGetNumPortURLs ||
+      (!g_fns.GCGetPortURL && !g_fns.GCGetPortURLInfo)) {
+    status_ = "GenTL sin API de puerto remoto";
+    remote_status_ = status_;
+    return false;
+  }
+
+  PORT_HANDLE port = nullptr;
+  GC_ERROR err = g_fns.DevGetPort(dev_, &port);
+  if (err != GC_SUCCESS || !port) {
+    setStatusFromError("DevGetPort fallo", err);
+    remote_status_ = status_;
+    return false;
+  }
+
+  uint32_t num_urls = 0;
+  err = g_fns.GCGetNumPortURLs(port, &num_urls);
+  if (err != GC_SUCCESS || num_urls == 0) {
+    if (err != GC_SUCCESS) {
+      setStatusFromError("GCGetNumPortURLs fallo", err);
+    } else {
+      status_ = "RemoteDevice sin PortURLs GenApi";
+    }
+    remote_status_ = status_;
+    return false;
+  }
+
+  std::vector<std::string> urls;
+  urls.reserve(num_urls);
+  for (uint32_t i = 0; i < num_urls; ++i) {
+    std::string url;
+    if (getPortUrlInfoString(port, i, URL_INFO_URL, url)) {
+      urls.push_back(std::move(url));
+      continue;
+    }
+
+    int32_t scheme = -1;
+    uint64_t address = 0;
+    uint64_t file_size = 0;
+    std::string filename;
+    const bool have_scheme = getPortUrlInfoNumeric(port, i, URL_INFO_SCHEME, scheme);
+    const bool have_address = getPortUrlInfoNumeric(port, i, URL_INFO_FILE_REGISTER_ADDRESS, address);
+    const bool have_size = getPortUrlInfoNumeric(port, i, URL_INFO_FILE_SIZE, file_size);
+    (void)getPortUrlInfoString(port, i, URL_INFO_FILENAME, filename);
+
+    if (have_scheme) {
+      if (scheme == URL_SCHEME_LOCAL && have_address && have_size && file_size > 0) {
+        if (filename.empty()) filename = "remote_device.xml";
+        urls.push_back("local:///" + filename + ";" + std::to_string(address) + ";" +
+                       std::to_string(file_size));
+        continue;
+      }
+      if (scheme == URL_SCHEME_FILE && !filename.empty()) {
+        urls.push_back("file:///" + filename);
+        continue;
+      }
+    }
+
+    if (i == 0 && g_fns.GCGetPortURL) {
+      size_t size = 0;
+      if (g_fns.GCGetPortURL(port, nullptr, &size) == GC_SUCCESS && size > 0) {
+        std::string legacy_url(size, '\0');
+        if (g_fns.GCGetPortURL(port, legacy_url.data(), &size) == GC_SUCCESS) {
+          legacy_url = trimTrailingNulls(legacy_url);
+          if (!legacy_url.empty()) {
+            urls.push_back(std::move(legacy_url));
+          }
+        }
+      }
+    }
+  }
+  if (urls.empty()) {
+    status_ = "PortURLs GenApi vacias";
+    remote_status_ = status_;
+    return false;
+  }
+
+  std::vector<uint8_t> xml_data;
+  bool zipped = false;
+  if (!fetchPortXml(port, urls, xml_data, zipped) || xml_data.empty()) {
+    status_ = "No se pudo cargar XML remoto GenApi";
+    remote_status_ = status_;
+    return false;
+  }
+
+  try {
+    GenApi::CNodeMapFactory factory(zipped ? GenApi::ContentType_ZippedXml : GenApi::ContentType_Xml,
+                                    xml_data.data(), xml_data.size(), GenApi::CacheUsage_Ignore, true);
+    GenApi::INodeMap* node_map = factory.CreateNodeMap("RemoteDevice", true);
+    if (!node_map) {
+      return false;
+    }
+
+    std::unique_ptr<RemoteControlState> state(new RemoteControlState());
+    state->port = port;
+    state->xml_data = std::move(xml_data);
+    state->port_proxy = std::make_unique<RemoteControlState::PortProxy>(port);
+    state->node_map_ptr = node_map;
+    state->node_map = node_map;
+    if (!state->node_map._Connect(state->port_proxy.get())) {
+      return false;
+    }
+    state->loaded = true;
+    remote_control_ = state.release();
+    remote_status_ = "GenApi remoto activo";
+    return true;
+  } catch (const GenICam::GenericException& e) {
+    status_ = std::string("GenApi remoto fallo: ") + e.what();
+    remote_status_ = status_;
+    releaseRemoteControl();
+    return false;
+  } catch (const std::exception& e) {
+    status_ = std::string("GenApi remoto fallo: ") + e.what();
+    remote_status_ = status_;
+    releaseRemoteControl();
+    return false;
+  }
+#endif
+}
+
+void GenTLBackend::releaseRemoteControl() {
+  delete remote_control_;
+  remote_control_ = nullptr;
+}
+
+bool GenTLBackend::prepareRemoteAcquisition() {
+#ifndef HAVE_GENTL_GENAPI
+  return false;
+#else
+  if (!remote_control_ || !remote_control_->loaded) {
+    return false;
+  }
+
+  try {
+    GenApi::INodeMap& node_map = *remote_control_->node_map_ptr;
+    (void)trySetIntegerValue(node_map, "TLParamsLocked", 1);
+    trySetEnumValue(node_map, "AcquisitionMode", "Continuous");
+    tryDisableTrigger(node_map, "AcquisitionStart");
+    tryDisableTrigger(node_map, "FrameBurstStart");
+    tryDisableTrigger(node_map, "FrameStart");
+    return true;
+  } catch (const GenICam::GenericException& e) {
+    status_ = std::string("Preparacion GenApi fallo: ") + e.what();
+    return false;
+  }
+#endif
+}
+
+bool GenTLBackend::startRemoteAcquisition() {
+#ifndef HAVE_GENTL_GENAPI
+  return false;
+#else
+  if (!remote_control_ || !remote_control_->loaded) {
+    return true;
+  }
+
+  try {
+    if (remote_control_->node_map_ptr && remote_control_->node_map_ptr->GetNode("AcquisitionStart")) {
+      return tryExecuteCommand(*remote_control_->node_map_ptr, "AcquisitionStart");
+    }
+    return true;
+  } catch (const GenICam::GenericException& e) {
+    status_ = std::string("AcquisitionStart fallo: ") + e.what();
+    return false;
+  }
+#endif
+}
+
+void GenTLBackend::stopRemoteAcquisition() {
+#ifdef HAVE_GENTL_GENAPI
+  if (!remote_control_ || !remote_control_->loaded) {
+    return;
+  }
+
+  try {
+    if (remote_control_->node_map_ptr && remote_control_->node_map_ptr->GetNode("AcquisitionStop")) {
+      (void)tryExecuteCommand(*remote_control_->node_map_ptr, "AcquisitionStop");
+    }
+    if (remote_control_->node_map_ptr) {
+      (void)trySetIntegerValue(*remote_control_->node_map_ptr, "TLParamsLocked", 0);
+    }
+  } catch (...) {
+  }
+#endif
 }
 
 bool GenTLBackend::openDataStream() {
@@ -526,6 +1236,8 @@ bool GenTLBackend::queueBuffer(GenTLHandle buffer) {
 
 void GenTLBackend::close() {
   stop();
+  releaseRemoteControl();
+  remote_status_.clear();
 
   if (dev_ && g_fns.DevClose) {
     g_fns.DevClose(dev_);
@@ -546,6 +1258,13 @@ bool GenTLBackend::start() {
   if (acquisition_started_) return true;
 
   if (!openDataStream()) {
+    return false;
+  }
+  const bool remote_ready = ensureRemoteControl();
+  const std::string remote_status = remote_status_;
+  if (remote_ready && !prepareRemoteAcquisition()) {
+    remote_status_ = status_;
+    stop();
     return false;
   }
   if (!registerNewBufferEvent()) {
@@ -590,13 +1309,22 @@ bool GenTLBackend::start() {
     stop();
     return false;
   }
+  if (remote_ready && !startRemoteAcquisition()) {
+    stop();
+    return false;
+  }
 
   acquisition_started_ = true;
-  status_ = "GenTL streaming";
+  status_ = remote_ready ? "GenTL streaming (control remoto activo)"
+                         : (remote_status.empty() ? "GenTL streaming (sin control remoto)"
+                                                  : "GenTL streaming (sin control remoto: " +
+                                                        remote_status + ")");
   return true;
 }
 
 void GenTLBackend::stop() {
+  stopRemoteAcquisition();
+
   if (new_buffer_event_ && g_fns.EventKill) {
     g_fns.EventKill(new_buffer_event_);
   }
@@ -642,6 +1370,10 @@ bool GenTLBackend::grab(Frame& out) {
   size_t event_size = sizeof(event_data);
   GC_ERROR err = g_fns.EventGetData(new_buffer_event_, &event_data, &event_size, 200);
   if (err == GC_ERR_TIMEOUT || err == GC_ERR_ABORT) {
+    status_ = remote_control_ && remote_control_->loaded
+                  ? "Esperando buffers GenTL (control remoto activo)"
+                  : (remote_status_.empty() ? "Esperando buffers GenTL"
+                                            : "Esperando buffers GenTL (" + remote_status_ + ")");
     return false;
   }
   if (err != GC_SUCCESS) {
@@ -781,4 +1513,177 @@ bool GenTLBackend::grab(Frame& out) {
 
 bool GenTLBackend::isOpen() const {
   return dev_ != nullptr;
+}
+
+bool GenTLBackend::supportsFeatures() const {
+#ifdef HAVE_GENTL_GENAPI
+  return dev_ != nullptr;
+#else
+  return false;
+#endif
+}
+
+std::vector<FeatureInfo> GenTLBackend::listFeatures() {
+  std::vector<FeatureInfo> features;
+#ifndef HAVE_GENTL_GENAPI
+  status_ = "GenApi remoto no compilado";
+  return features;
+#else
+  if (!dev_) {
+    status_ = "No hay dispositivo GenTL abierto";
+    return features;
+  }
+  if (!ensureRemoteControl()) {
+    status_ = remote_status_.empty() ? "No se pudo inicializar GenApi remoto" : remote_status_;
+    return features;
+  }
+
+  try {
+    GenApi::NodeList_t nodes;
+    remote_control_->node_map_ptr->GetNodes(nodes);
+    features.reserve(nodes.size());
+    for (GenApi::INode* node : nodes) {
+      if (!isUserFeatureNode(node)) {
+        continue;
+      }
+
+      FeatureInfo info;
+      fillFeatureInfo(*node, info);
+      if (info.id.empty()) {
+        continue;
+      }
+      features.push_back(std::move(info));
+    }
+
+    status_ = features.empty() ? "Sin features GenApi" : "Features GenApi cargadas";
+  } catch (const GenICam::GenericException& e) {
+    status_ = std::string("Listado GenApi fallo: ") + e.what();
+    features.clear();
+  } catch (const std::exception& e) {
+    status_ = std::string("Listado GenApi fallo: ") + e.what();
+    features.clear();
+  }
+  return features;
+#endif
+}
+
+bool GenTLBackend::getFeatureValue(const FeatureInfo& info, FeatureValue& out) {
+#ifndef HAVE_GENTL_GENAPI
+  (void)info;
+  (void)out;
+  status_ = "GenApi remoto no compilado";
+  return false;
+#else
+  if (!dev_) {
+    status_ = "No hay dispositivo GenTL abierto";
+    return false;
+  }
+  if (!ensureRemoteControl()) {
+    status_ = remote_status_.empty() ? "No se pudo inicializar GenApi remoto" : remote_status_;
+    return false;
+  }
+
+  GenApi::INode* node = remote_control_->node_map_ptr->GetNode(info.id.c_str());
+  if (!isUserFeatureNode(node)) {
+    status_ = "Feature GenApi no disponible: " + info.id;
+    return false;
+  }
+
+  try {
+    const bool ok = readFeatureValueFromNode(*node, info.type, out);
+    if (!ok) {
+      status_ = "No se pudo leer feature GenApi: " + info.id;
+    }
+    return ok;
+  } catch (const GenICam::GenericException& e) {
+    status_ = std::string("Lectura GenApi fallo: ") + e.what();
+    return false;
+  } catch (const std::exception& e) {
+    status_ = std::string("Lectura GenApi fallo: ") + e.what();
+    return false;
+  }
+#endif
+}
+
+bool GenTLBackend::setFeatureValue(const FeatureInfo& info, const FeatureValue& value) {
+#ifndef HAVE_GENTL_GENAPI
+  (void)info;
+  (void)value;
+  status_ = "GenApi remoto no compilado";
+  return false;
+#else
+  if (!dev_) {
+    status_ = "No hay dispositivo GenTL abierto";
+    return false;
+  }
+  if (!ensureRemoteControl()) {
+    status_ = remote_status_.empty() ? "No se pudo inicializar GenApi remoto" : remote_status_;
+    return false;
+  }
+
+  GenApi::INode* node = remote_control_->node_map_ptr->GetNode(info.id.c_str());
+  if (!isUserFeatureNode(node)) {
+    status_ = "Feature GenApi no disponible: " + info.id;
+    return false;
+  }
+
+  try {
+    const bool ok = writeFeatureValueToNode(*node, info.type, value);
+    if (ok) {
+      status_ = "Feature GenApi actualizada";
+    } else {
+      status_ = "No se pudo escribir feature GenApi: " + info.id;
+    }
+    return ok;
+  } catch (const GenICam::GenericException& e) {
+    status_ = std::string("Escritura GenApi fallo: ") + e.what();
+    return false;
+  } catch (const std::exception& e) {
+    status_ = std::string("Escritura GenApi fallo: ") + e.what();
+    return false;
+  }
+#endif
+}
+
+bool GenTLBackend::executeCommand(const FeatureInfo& info) {
+#ifndef HAVE_GENTL_GENAPI
+  (void)info;
+  status_ = "GenApi remoto no compilado";
+  return false;
+#else
+  if (!dev_) {
+    status_ = "No hay dispositivo GenTL abierto";
+    return false;
+  }
+  if (!ensureRemoteControl()) {
+    status_ = remote_status_.empty() ? "No se pudo inicializar GenApi remoto" : remote_status_;
+    return false;
+  }
+
+  GenApi::INode* node = remote_control_->node_map_ptr->GetNode(info.id.c_str());
+  if (!isUserFeatureNode(node)) {
+    status_ = "Feature GenApi no disponible: " + info.id;
+    return false;
+  }
+
+  try {
+    if (info.type != FeatureType::Command) {
+      status_ = "La feature no es un comando: " + info.id;
+      return false;
+    }
+    const bool ok = tryExecuteCommand(*remote_control_->node_map_ptr, info.id.c_str());
+    if (ok) {
+      status_ = "Comando GenApi ejecutado";
+    } else {
+      status_ = "No se pudo ejecutar comando GenApi: " + info.id;
+    }
+    return ok;
+  } catch (const GenICam::GenericException& e) {
+    status_ = std::string("Comando GenApi fallo: ") + e.what();
+    return false;
+  } catch (const std::exception& e) {
+    status_ = std::string("Comando GenApi fallo: ") + e.what();
+    return false;
+  }
+#endif
 }

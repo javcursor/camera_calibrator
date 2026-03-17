@@ -2128,6 +2128,7 @@ void ImGuiApp::updateOfflinePathPicker() {
   OfflinePathPickerTarget target = OfflinePathPickerTarget::None;
   bool pick_directory = false;
   bool selection_made = false;
+  int slot_index = -1;
   std::string selected_path;
   std::string error_message;
   bool has_result = false;
@@ -2140,6 +2141,7 @@ void ImGuiApp::updateOfflinePathPicker() {
     target = offline_path_picker_.target;
     pick_directory = offline_path_picker_.pick_directory;
     selection_made = offline_path_picker_.selection_made;
+    slot_index = offline_path_picker_.slot_index;
     selected_path = offline_path_picker_.selected_path;
     error_message = offline_path_picker_.error_message;
     offline_path_picker_.result_ready = false;
@@ -2172,6 +2174,9 @@ void ImGuiApp::updateOfflinePathPicker() {
   } else if (target == OfflinePathPickerTarget::VideoFile && !pick_directory) {
     offline_video_path_ = selected_path;
     openOfflineVideo();
+  } else if (target == OfflinePathPickerTarget::GenTLCtiFile && !pick_directory &&
+             slot_index >= 0 && static_cast<size_t>(slot_index) < slots_.size()) {
+    slots_[static_cast<size_t>(slot_index)]->gentl_cti_path = selected_path;
   }
 }
 
@@ -2183,6 +2188,7 @@ void ImGuiApp::stopOfflinePathPicker() {
   offline_path_picker_.running = false;
   offline_path_picker_.result_ready = false;
   offline_path_picker_.show_popup = false;
+  offline_path_picker_.slot_index = -1;
   offline_path_picker_.target = OfflinePathPickerTarget::None;
 }
 
@@ -2230,7 +2236,7 @@ void ImGuiApp::drawOfflinePathPickerPopup() {
 }
 
 bool ImGuiApp::requestOfflinePathPicker(OfflinePathPickerTarget target, bool pick_directory,
-                                        const std::string& current_value) {
+                                        const std::string& current_value, int slot_index) {
   bool is_running = false;
   {
     std::lock_guard<std::mutex> lock(offline_path_picker_.mutex);
@@ -2252,6 +2258,7 @@ bool ImGuiApp::requestOfflinePathPicker(OfflinePathPickerTarget target, bool pic
     offline_path_picker_.show_popup = true;
     offline_path_picker_.pick_directory = pick_directory;
     offline_path_picker_.selection_made = false;
+    offline_path_picker_.slot_index = slot_index;
     offline_path_picker_.target = target;
     offline_path_picker_.current_value = current_value;
     offline_path_picker_.progress_message =
@@ -2262,7 +2269,7 @@ bool ImGuiApp::requestOfflinePathPicker(OfflinePathPickerTarget target, bool pic
   }
 
   offline_status_ = pick_directory ? "Seleccionando carpeta..." : "Seleccionando archivo...";
-  offline_path_picker_.worker = std::thread([this, target, pick_directory, current_value]() {
+  offline_path_picker_.worker = std::thread([this, target, pick_directory, current_value, slot_index]() {
     std::string error_message;
     std::optional<std::string> selected_path =
         pick_directory ? pickDirectory(current_value, &error_message)
@@ -2272,6 +2279,7 @@ bool ImGuiApp::requestOfflinePathPicker(OfflinePathPickerTarget target, bool pic
     offline_path_picker_.selection_made = selected_path.has_value();
     offline_path_picker_.selected_path = selected_path.value_or(std::string{});
     offline_path_picker_.error_message = std::move(error_message);
+    offline_path_picker_.slot_index = slot_index;
     offline_path_picker_.target = target;
     offline_path_picker_.running = false;
     offline_path_picker_.result_ready = true;
@@ -3298,10 +3306,31 @@ void ImGuiApp::drawCameraSlot(size_t index, CameraSlot& slot) {
   const bool is_any_opencv_backend = is_opencv_backend || is_opencv_gstreamer_backend;
 
   if (slot.device.backendType() == BackendType::GenTL) {
+    bool cti_picker_running = false;
+    {
+      std::lock_guard<std::mutex> lock(offline_path_picker_.mutex);
+      cti_picker_running =
+          offline_path_picker_.running &&
+          offline_path_picker_.target == OfflinePathPickerTarget::GenTLCtiFile &&
+          offline_path_picker_.slot_index == static_cast<int>(index);
+    }
     const std::string cti_input_id = "##cti_path_" + std::to_string(index);
+    const std::string cti_browse_id = "##cti_path_browse_" + std::to_string(index);
     ImGui::TextUnformatted("CTI path");
-    ImGui::SetNextItemWidth(-FLT_MIN);
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const float browse_btn_size = ImGui::GetFrameHeight();
+    const float input_width =
+        std::max(1.0f, ImGui::GetContentRegionAvail().x - browse_btn_size - style.ItemInnerSpacing.x);
+    if (cti_picker_running) ImGui::BeginDisabled();
+    ImGui::SetNextItemWidth(input_width);
     ImGui::InputText(cti_input_id.c_str(), &slot.gentl_cti_path);
+    ImGui::SameLine(0.0f, style.ItemInnerSpacing.x);
+    if (iconButton(cti_browse_id.c_str(), UiIcon::Folder, browse_btn_size, defaultIconColor())) {
+      requestOfflinePathPicker(OfflinePathPickerTarget::GenTLCtiFile, false, slot.gentl_cti_path,
+                               static_cast<int>(index));
+    }
+    itemTooltip("Browse for the GenTL producer (.cti) file.");
+    if (cti_picker_running) ImGui::EndDisabled();
     if (ImGui::Button("Load CTI", ImVec2(-1, 0))) {
       slot.device.setBackendOption("cti_path", slot.gentl_cti_path);
       refreshDevices(slot);

@@ -67,8 +67,67 @@ if(PkgConfig_FOUND)
   pkg_check_modules(ARAVIS QUIET aravis-0.8)
 endif()
 
+set(GENICAM_ROOT "" CACHE PATH "Optional root containing GenICam headers and libraries")
+
+set(_genicam_roots
+  "${GENICAM_ROOT}"
+  "$ENV{GENICAM_ROOT}"
+  "/usr"
+  "/usr/local"
+  "/opt"
+)
+
+file(GLOB _opt_roots LIST_DIRECTORIES true "/opt/*")
+list(SORT _opt_roots)
+list(APPEND _genicam_roots ${_opt_roots})
+
+set(_genicam_search_roots)
+foreach(root IN LISTS _genicam_roots)
+  if(root AND EXISTS "${root}")
+    list(APPEND _genicam_search_roots "${root}")
+  endif()
+endforeach()
+list(REMOVE_DUPLICATES _genicam_search_roots)
+
+find_path(GENICAM_INCLUDE_DIR
+  NAMES GenApi/NodeMapFactory.h Base/GCException.h
+  HINTS ${_genicam_search_roots}
+  PATH_SUFFIXES include
+)
+
+function(find_genicam_library out_var stem)
+  foreach(root IN LISTS _genicam_search_roots)
+    foreach(suffix IN ITEMS lib lib64 bin/Linux64_x64 bin/Linux64_ARM64)
+      file(GLOB candidates LIST_DIRECTORIES false
+        "${root}/${suffix}/lib${stem}*.so"
+        "${root}/${suffix}/lib${stem}*.so.*"
+      )
+      list(SORT candidates)
+      if(candidates)
+        list(GET candidates 0 candidate)
+        set(${out_var} "${candidate}" PARENT_SCOPE)
+        return()
+      endif()
+    endforeach()
+  endforeach()
+  set(${out_var} "" PARENT_SCOPE)
+endfunction()
+
+find_genicam_library(GENICAM_GENAPI_LIBRARY GenApi)
+find_genicam_library(GENICAM_GCBASE_LIBRARY GCBase)
+
+if(GENICAM_INCLUDE_DIR AND GENICAM_GENAPI_LIBRARY AND GENICAM_GCBASE_LIBRARY)
+  set(GENICAM_FOUND TRUE)
+else()
+  set(GENICAM_FOUND FALSE)
+endif()
+
 if(ARAVIS_FOUND)
   add_compile_definitions(HAVE_ARAVIS)
+endif()
+
+if(GENICAM_FOUND)
+  add_compile_definitions(HAVE_GENTL_GENAPI)
 endif()
 
 set(CALIB_SOURCES
@@ -105,6 +164,14 @@ target_include_directories(camera_calibrator PRIVATE include)
 if(UNIX)
   target_compile_definitions(camera_calibrator PRIVATE HAVE_GENTL)
   target_link_libraries(camera_calibrator PRIVATE ${CMAKE_DL_LIBS})
+endif()
+
+if(GENICAM_FOUND)
+  get_filename_component(GENICAM_LIBRARY_DIR "${GENICAM_GENAPI_LIBRARY}" DIRECTORY)
+  target_include_directories(camera_calibrator PRIVATE ${GENICAM_INCLUDE_DIR})
+  target_link_libraries(camera_calibrator PRIVATE ${GENICAM_GENAPI_LIBRARY} ${GENICAM_GCBASE_LIBRARY})
+  set_property(TARGET camera_calibrator APPEND PROPERTY BUILD_RPATH "${GENICAM_LIBRARY_DIR}")
+  set_property(TARGET camera_calibrator APPEND PROPERTY INSTALL_RPATH "${GENICAM_LIBRARY_DIR}")
 endif()
 
 if(ARAVIS_FOUND)

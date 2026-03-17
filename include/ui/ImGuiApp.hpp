@@ -46,6 +46,7 @@ class ImGuiApp {
     None = 0,
     ImageFolder = 1,
     VideoFile = 2,
+    GenTLCtiFile = 3,
   };
 
   enum class OfflineDetectionState {
@@ -158,6 +159,7 @@ class ImGuiApp {
     bool show_popup = false;
     bool pick_directory = false;
     bool selection_made = false;
+    int slot_index = -1;
     OfflinePathPickerTarget target = OfflinePathPickerTarget::None;
     std::string current_value;
     std::string progress_message;
@@ -241,7 +243,7 @@ class ImGuiApp {
                              const std::string& status_message);
   void invalidateOfflineDetection();
   bool requestOfflinePathPicker(OfflinePathPickerTarget target, bool pick_directory,
-                                const std::string& current_value);
+                                const std::string& current_value, int slot_index = -1);
   bool requestOfflineImageLoad(int index);
   bool loadOfflineImage(int index);
   bool openOfflineVideo();
