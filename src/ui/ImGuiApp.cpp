@@ -3754,19 +3754,47 @@ void ImGuiApp::drawCalibrationPanel(CameraSlot* active) {
   }
 
   ImGui::TextUnformatted("Camera model");
+#ifdef HAVE_OPENCV_OMNIDIR
+  const char* camera_model_labels[] = {"Standard (pinhole)", "Fisheye", "Omnidir (>180 deg FOV)"};
+  const char* camera_model_tooltips[] = {
+      "Use the standard pinhole model for conventional lenses.",
+      "Use the fisheye model for very wide-angle lenses with strong distortion up to about 180 degrees.",
+      "Use OpenCV omnidir (Mei model) for fisheye/catadioptric cameras that exceed 180 degrees field of view.",
+  };
+#else
   const char* camera_model_labels[] = {"Standard (pinhole)", "Fisheye"};
   const char* camera_model_tooltips[] = {
       "Use the standard pinhole model for conventional lenses.",
       "Use the fisheye model for very wide-angle lenses with strong distortion.",
   };
-  int camera_model_index = (camera_model_ == CameraModel::Fisheye) ? 1 : 0;
+#endif
+  int camera_model_index = 0;
+  if (camera_model_ == CameraModel::Fisheye) {
+    camera_model_index = 1;
+  }
+#ifdef HAVE_OPENCV_OMNIDIR
+  if (camera_model_ == CameraModel::Omnidir) {
+    camera_model_index = 2;
+  }
+#endif
   ImGui::SetNextItemWidth(-FLT_MIN);
   if (comboWithTooltips("##camera_model", &camera_model_index, camera_model_labels,
                         IM_ARRAYSIZE(camera_model_labels), camera_model_tooltips)) {
-    camera_model_ = (camera_model_index == 1) ? CameraModel::Fisheye : CameraModel::Pinhole;
+    camera_model_ = CameraModel::Pinhole;
+    if (camera_model_index == 1) {
+      camera_model_ = CameraModel::Fisheye;
+    }
+#ifdef HAVE_OPENCV_OMNIDIR
+    if (camera_model_index == 2) {
+      camera_model_ = CameraModel::Omnidir;
+    }
+#endif
     calibrator_.setCameraModel(camera_model_);
   }
-  itemTooltip("Select intrinsic model: pinhole (standard) or fisheye.");
+  itemTooltip("Select intrinsic model: pinhole, fisheye, or omnidir when available.");
+#ifndef HAVE_OPENCV_OMNIDIR
+  ImGui::TextWrapped("For fisheye lenses above 180 degrees FOV, rebuild OpenCV with contrib `ccalib` to enable Omnidir.");
+#endif
 
   if (camera_model_ == CameraModel::Pinhole) {
     ImGui::TextUnformatted("Pinhole distortion");
@@ -3902,8 +3930,17 @@ void ImGuiApp::drawCalibrationPanel(CameraSlot* active) {
 
   const auto& calib_result = calibrator_.result();
   if (calib_result.valid) {
-    ImGui::Text("Model: %s", calib_result.model == CameraModel::Fisheye ? "fisheye" : "pinhole");
+    const char* model_name = "pinhole";
+    if (calib_result.model == CameraModel::Fisheye) {
+      model_name = "fisheye";
+    } else if (calib_result.model == CameraModel::Omnidir) {
+      model_name = "omnidir";
+    }
+    ImGui::Text("Model: %s", model_name);
     ImGui::Text("RMS: %.5f", calib_result.rms);
+    if (calib_result.model == CameraModel::Omnidir && !calib_result.xi.empty()) {
+      ImGui::Text("xi: %.6f", calib_result.xi.at<double>(0, 0));
+    }
     ImGui::Text("Inliers: %d  Rejected: %d",
                 static_cast<int>(calib_result.inlier_sample_indices.size()),
                 static_cast<int>(calib_result.rejected_sample_indices.size()));
@@ -3949,7 +3986,7 @@ void ImGuiApp::drawCalibrationPanel(CameraSlot* active) {
     ImGui::TextWrapped("Stereo calibration requires live synchronized streams.");
     return;
   }
-  if (camera_model_ == CameraModel::Fisheye) {
+  if (camera_model_ != CameraModel::Pinhole) {
     ImGui::TextWrapped("Stereo calibration currently uses the standard pinhole model.");
   }
   ImGui::TextUnformatted("Enable stereo pair");

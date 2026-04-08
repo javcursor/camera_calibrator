@@ -3,6 +3,9 @@
 #ifdef HAVE_OPENCV_ARUCO
 #include <opencv2/aruco/charuco.hpp>
 #endif
+#ifdef HAVE_OPENCV_OMNIDIR
+#include <opencv2/ccalib/omnidir.hpp>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -60,6 +63,8 @@ const char* cameraModelName(CameraModel model) {
       return "pinhole";
     case CameraModel::Fisheye:
       return "fisheye";
+    case CameraModel::Omnidir:
+      return "omnidir";
     default:
       return "unknown";
   }
@@ -128,6 +133,27 @@ void appendFloatSequence(cv::FileStorage& fs, const char* key, const std::vector
   fs << "]";
 }
 
+double scalarFromMat(const cv::Mat& value) {
+  if (value.empty()) return 0.0;
+  cv::Mat flat = value.reshape(1, 1);
+  cv::Mat flat64;
+  flat.convertTo(flat64, CV_64F);
+  return flat64.at<double>(0, 0);
+}
+
+std::vector<int> intVectorFromMat(const cv::Mat& value) {
+  std::vector<int> out;
+  if (value.empty()) return out;
+  cv::Mat flat = value.reshape(1, 1);
+  cv::Mat flat32;
+  flat.convertTo(flat32, CV_32S);
+  out.reserve(flat32.cols);
+  for (int i = 0; i < flat32.cols; ++i) {
+    out.push_back(flat32.at<int>(0, i));
+  }
+  return out;
+}
+
 struct PreparedMonoSample {
   int sample_index = -1;
   std::vector<cv::Point3f> object_points;
@@ -139,8 +165,10 @@ struct SolveOutput {
   std::string error;
   cv::Mat camera_matrix;
   cv::Mat dist_coeffs;
+  cv::Mat xi;
   std::vector<cv::Mat> rvecs;
   std::vector<cv::Mat> tvecs;
+  std::vector<int> used_prepared_indices;
   cv::Mat refined_object_points;
   double rms = 0.0;
 };
@@ -151,12 +179,25 @@ bool projectPointsForModel(CameraModel model,
                            const cv::Mat& tvec,
                            const cv::Mat& camera_matrix,
                            const cv::Mat& dist_coeffs,
+                           const cv::Mat& xi,
                            std::vector<cv::Point2f>& projected) {
   try {
-    if (model == CameraModel::Fisheye) {
-      cv::fisheye::projectPoints(object_points, projected, rvec, tvec, camera_matrix, dist_coeffs);
-    } else {
-      cv::projectPoints(object_points, rvec, tvec, camera_matrix, dist_coeffs, projected);
+    switch (model) {
+      case CameraModel::Fisheye:
+        cv::fisheye::projectPoints(object_points, projected, rvec, tvec, camera_matrix, dist_coeffs);
+        break;
+      case CameraModel::Omnidir:
+#ifdef HAVE_OPENCV_OMNIDIR
+        cv::omnidir::projectPoints(object_points, projected, rvec, tvec,
+                                   camera_matrix, scalarFromMat(xi), dist_coeffs);
+        break;
+#else
+        return false;
+#endif
+      case CameraModel::Pinhole:
+      default:
+        cv::projectPoints(object_points, rvec, tvec, camera_matrix, dist_coeffs, projected);
+        break;
     }
   } catch (const cv::Exception&) {
     return false;
@@ -165,16 +206,17 @@ bool projectPointsForModel(CameraModel model,
 }
 
 std::vector<double> computeViewErrors(const std::vector<PreparedMonoSample>& prepared,
-                                      const std::vector<int>& active_indices,
+                                      const std::vector<int>& solve_prepared_indices,
                                       const std::vector<cv::Mat>& rvecs,
                                       const std::vector<cv::Mat>& tvecs,
                                       CameraModel model,
                                       const cv::Mat& camera_matrix,
                                       const cv::Mat& dist_coeffs,
+                                      const cv::Mat& xi,
                                       ResidualGrid* residual_grid,
                                       const cv::Size& image_size) {
   std::vector<double> per_view_errors;
-  per_view_errors.reserve(active_indices.size());
+  per_view_errors.reserve(solve_prepared_indices.size());
 
   const bool compute_grid = (residual_grid != nullptr && image_size.width > 0 && image_size.height > 0);
   std::vector<double> sum_err;
@@ -195,8 +237,8 @@ std::vector<double> computeViewErrors(const std::vector<PreparedMonoSample>& pre
     }
   }
 
-  for (size_t i = 0; i < active_indices.size(); ++i) {
-    const int prepared_idx = active_indices[i];
+  for (size_t i = 0; i < solve_prepared_indices.size(); ++i) {
+    const int prepared_idx = solve_prepared_indices[i];
     if (prepared_idx < 0 || prepared_idx >= static_cast<int>(prepared.size()) ||
         i >= rvecs.size() || i >= tvecs.size()) {
       per_view_errors.push_back(0.0);
@@ -207,7 +249,7 @@ std::vector<double> computeViewErrors(const std::vector<PreparedMonoSample>& pre
     std::vector<cv::Point2f> projected;
     if (!projectPointsForModel(model, sample.object_points,
                                rvecs[i], tvecs[i],
-                               camera_matrix, dist_coeffs,
+                               camera_matrix, dist_coeffs, xi,
                                projected)) {
       per_view_errors.push_back(0.0);
       continue;
@@ -504,13 +546,16 @@ bool CalibrationSession::calibrate(const cv::Size& image_size,
 
     std::vector<std::vector<cv::Point3f>> object_points;
     std::vector<std::vector<cv::Point2f>> image_points;
+    std::vector<int> input_to_prepared;
     object_points.reserve(active_indices.size());
     image_points.reserve(active_indices.size());
+    input_to_prepared.reserve(active_indices.size());
 
     for (int idx : active_indices) {
       if (idx < 0 || idx >= static_cast<int>(prepared.size())) continue;
       object_points.push_back(prepared[static_cast<size_t>(idx)].object_points);
       image_points.push_back(prepared[static_cast<size_t>(idx)].image_points);
+      input_to_prepared.push_back(idx);
     }
 
     if (object_points.size() < 5U) {
@@ -520,8 +565,10 @@ bool CalibrationSession::calibrate(const cv::Size& image_size,
 
     cv::Mat k = cv::Mat::eye(3, 3, CV_64F);
     cv::Mat d;
+    cv::Mat xi;
     std::vector<cv::Mat> rvecs;
     std::vector<cv::Mat> tvecs;
+    cv::Mat used_idx;
 
     try {
       if (camera_model_ == CameraModel::Fisheye) {
@@ -530,6 +577,18 @@ bool CalibrationSession::calibrate(const cv::Size& image_size,
         const cv::TermCriteria criteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 100, 1e-6);
         out.rms = cv::fisheye::calibrate(object_points, image_points, image_size,
                                          k, d, rvecs, tvecs, flags, criteria);
+      } else if (camera_model_ == CameraModel::Omnidir) {
+#ifdef HAVE_OPENCV_OMNIDIR
+        xi = cv::Mat::zeros(1, 1, CV_64F);
+        d = cv::Mat::zeros(4, 1, CV_64F);
+        int flags = cv::omnidir::CALIB_FIX_SKEW;
+        const cv::TermCriteria criteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 200, 1e-4);
+        out.rms = cv::omnidir::calibrate(object_points, image_points, image_size,
+                                         k, xi, d, rvecs, tvecs, flags, criteria, used_idx);
+#else
+        out.error = "Modelo omnidir no disponible: falta OpenCV ccalib/omnidir";
+        return out;
+#endif
       } else {
         int flags = 0;
         if (pinhole_distortion_model_ == PinholeDistortionModel::RationalPolynomial) {
@@ -561,9 +620,37 @@ bool CalibrationSession::calibrate(const cv::Size& image_size,
       return out;
     }
 
+    if (camera_model_ == CameraModel::Omnidir) {
+#ifdef HAVE_OPENCV_OMNIDIR
+      std::vector<int> used_input_positions = intVectorFromMat(used_idx);
+      if (used_input_positions.empty() && rvecs.size() == input_to_prepared.size()) {
+        used_input_positions.resize(input_to_prepared.size());
+        std::iota(used_input_positions.begin(), used_input_positions.end(), 0);
+      }
+      out.used_prepared_indices.reserve(used_input_positions.size());
+      for (int pos : used_input_positions) {
+        if (pos < 0 || pos >= static_cast<int>(input_to_prepared.size())) continue;
+        out.used_prepared_indices.push_back(input_to_prepared[static_cast<size_t>(pos)]);
+      }
+#endif
+    } else {
+      out.used_prepared_indices = input_to_prepared;
+    }
+
+    if (out.used_prepared_indices.size() != rvecs.size() ||
+        out.used_prepared_indices.size() != tvecs.size()) {
+      out.error = "El solver devolvio un numero inconsistente de vistas";
+      return out;
+    }
+    if (out.used_prepared_indices.size() < 5U) {
+      out.error = "El solver no pudo usar al menos 5 muestras";
+      return out;
+    }
+
     out.ok = true;
     out.camera_matrix = k;
     out.dist_coeffs = d;
+    out.xi = xi;
     out.rvecs = std::move(rvecs);
     out.tvecs = std::move(tvecs);
     return out;
@@ -577,6 +664,26 @@ bool CalibrationSession::calibrate(const cv::Size& image_size,
   constexpr int kMaxRobustIterations = 6;
   const float robust_begin = 0.30f;
   const float robust_span = 0.42f;
+  auto dropUnusedViews = [&](const std::vector<int>& candidate_indices,
+                             const std::vector<int>& used_indices) {
+    std::vector<int> next_active = used_indices;
+    if (used_indices.size() == candidate_indices.size()) {
+      return next_active;
+    }
+
+    std::unordered_map<int, bool> used_lookup;
+    used_lookup.reserve(used_indices.size());
+    for (int idx : used_indices) {
+      used_lookup[idx] = true;
+    }
+
+    for (int prepared_idx : candidate_indices) {
+      if (used_lookup.find(prepared_idx) != used_lookup.end()) continue;
+      const int sample_idx = prepared[static_cast<size_t>(prepared_idx)].sample_index;
+      rejected_sample_indices.push_back(sample_idx);
+    }
+    return next_active;
+  };
 
   for (int iter = 0; iter < kMaxRobustIterations; ++iter) {
     const float iteration_base =
@@ -590,13 +697,19 @@ bool CalibrationSession::calibrate(const cv::Size& image_size,
       return fail(solve.error, iteration_base);
     }
 
+    active_indices = dropUnusedViews(active_indices, solve.used_prepared_indices);
+    if (active_indices.size() < 5U) {
+      return fail("Tras filtrar vistas no inicializadas quedan menos de 5 muestras",
+                  iteration_base);
+    }
+
     reportCalibrationProgress(progress_callback,
                               iteration_base + robust_span * (0.45f / static_cast<float>(kMaxRobustIterations)),
                               "Analizando errores por vista...");
     const std::vector<double> view_errors = computeViewErrors(
         prepared, active_indices,
         solve.rvecs, solve.tvecs,
-        camera_model_, solve.camera_matrix, solve.dist_coeffs,
+        camera_model_, solve.camera_matrix, solve.dist_coeffs, solve.xi,
         nullptr, image_size);
 
     const double med = medianOf(view_errors);
@@ -656,6 +769,11 @@ bool CalibrationSession::calibrate(const cv::Size& image_size,
     return fail(solve.error, 0.78f);
   }
 
+  active_indices = dropUnusedViews(active_indices, solve.used_prepared_indices);
+  if (active_indices.size() < 5U) {
+    return fail("La solucion final no pudo usar al menos 5 muestras", 0.78f);
+  }
+
   ResidualGrid grid;
   grid.cols = 16;
   grid.rows = 12;
@@ -663,7 +781,7 @@ bool CalibrationSession::calibrate(const cv::Size& image_size,
   std::vector<double> final_view_errors = computeViewErrors(
       prepared, active_indices,
       solve.rvecs, solve.tvecs,
-      camera_model_, solve.camera_matrix, solve.dist_coeffs,
+      camera_model_, solve.camera_matrix, solve.dist_coeffs, solve.xi,
       &grid, image_size);
 
   std::vector<int> inlier_sample_indices;
@@ -684,6 +802,7 @@ bool CalibrationSession::calibrate(const cv::Size& image_size,
   result_.pinhole_distortion = pinhole_distortion_model_;
   result_.camera_matrix = solve.camera_matrix;
   result_.dist_coeffs = solve.dist_coeffs;
+  result_.xi = solve.xi;
   result_.refined_object_points = solve.refined_object_points;
   result_.image_size = image_size;
   result_.target_warp_compensation_used =
@@ -705,6 +824,8 @@ bool CalibrationSession::calibrate(const cv::Size& image_size,
          << ", RMS=" << result_.rms;
   if (camera_model_ == CameraModel::Fisheye) {
     status << " (fisheye)";
+  } else if (camera_model_ == CameraModel::Omnidir) {
+    status << " (omnidir, xi=" << scalarFromMat(result_.xi) << ")";
   } else {
     status << " (" << pinholeModelName(pinhole_distortion_model_) << ")";
   }
@@ -728,12 +849,17 @@ bool CalibrationSession::saveResult(const std::string& path) const {
   std::string distortion_model;
   if (result_.model == CameraModel::Fisheye) {
     distortion_model = "fisheye";
+  } else if (result_.model == CameraModel::Omnidir) {
+    distortion_model = "mei_omnidir";
   } else {
     distortion_model = pinholeModelName(result_.pinhole_distortion);
   }
   fs << "distortion_model" << distortion_model;
   fs << "camera_matrix" << result_.camera_matrix;
   fs << "distortion_coefficients" << result_.dist_coeffs;
+  if (result_.model == CameraModel::Omnidir && !result_.xi.empty()) {
+    fs << "xi" << scalarFromMat(result_.xi);
+  }
   fs << "rms" << result_.rms;
 
   fs << "target_warp_compensation_used" << result_.target_warp_compensation_used;

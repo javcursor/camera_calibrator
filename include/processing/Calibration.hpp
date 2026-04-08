@@ -19,6 +19,7 @@ struct SampleMetrics {
 enum class CameraModel {
   Pinhole,
   Fisheye,
+  Omnidir,
 };
 
 enum class PinholeDistortionModel {
@@ -48,6 +49,7 @@ struct CalibrationResult {
   PinholeDistortionModel pinhole_distortion = PinholeDistortionModel::PlumbBob;
   cv::Mat camera_matrix;
   cv::Mat dist_coeffs;
+  cv::Mat xi;
   cv::Mat refined_object_points;
   cv::Size image_size;
   bool target_warp_compensation_used = false;

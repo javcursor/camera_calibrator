@@ -37,6 +37,7 @@ It is designed for practical lab and production workflows: connect a live camera
 - Camera model:
   - Standard pinhole
   - Fisheye
+  - Omnidir / Mei model for FOV > 180° (when OpenCV contrib `ccalib` is available)
 - Pinhole distortion model:
   - Plumb bob
   - Rational polynomial
@@ -75,6 +76,7 @@ Optional:
 - Aravis 0.8+ (GenICam/GigE Vision support)
 - GenTL producer (`.cti`) for GenTL backend
 - OpenCV ArUco module (for ChArUco)
+- OpenCV contrib `ccalib` / `omnidir` module (for omnidirectional calibration with FOV > 180°)
 
 Notes:
 - CMake fetches Dear ImGui and GLFW automatically if not found locally (internet access required at configure time).
@@ -181,6 +183,8 @@ Run:
   https://github.com/opencv/opencv/blob/4.x/modules/videoio/src/cap_gstreamer.cpp
 - OpenCV fisheye model:
   https://docs.opencv.org/4.x/db/d58/group__calib3d__fisheye.html
+- OpenCV omnidirectional calibration:
+  https://docs.opencv.org/4.x/dd/d12/tutorial_omnidir_calib_main.html
 - OpenCV ArUco/ChArUco calibration:
   https://docs.opencv.org/4.x/da/d13/tutorial_aruco_calibration.html
 - OpenCV camera calibration tutorial:
